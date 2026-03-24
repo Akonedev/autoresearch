@@ -247,6 +247,9 @@ class Tokenizer:
 
 def get_token_bytes(device="cpu"):
     path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    # Prefer CUDA/ROCm device if available
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
     with open(path, "rb") as f:
         return torch.load(f, map_location=device)
 
@@ -295,12 +298,20 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    # Use pinned memory only if CUDA/ROCm is available
+    use_pinned = torch.cuda.is_available()
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_pinned)
+    # Use GPU if available, else CPU
+    if torch.cuda.is_available():
+        gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+        inputs = gpu_buffer[:B * T].view(B, T)
+        targets = gpu_buffer[B * T:].view(B, T)
+    else:
+        gpu_buffer = None
+        inputs = cpu_buffer[:B * T].view(B, T)
+        targets = cpu_buffer[B * T:].view(B, T)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
 
     while True:
         for row_idx in range(B):
@@ -333,7 +344,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        if gpu_buffer is not None:
+            gpu_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -349,7 +361,9 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    # Use GPU if available (CUDA or ROCm), else CPU
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    token_bytes = get_token_bytes(device=device)
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0

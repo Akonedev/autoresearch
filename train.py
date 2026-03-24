@@ -16,18 +16,22 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint  # For gradient checkpointing
 
 # Detect AMD ROCm vs NVIDIA CUDA
 IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
+IS_CUDA = not IS_ROCM and torch.cuda.is_available()
 
-if not IS_ROCM:
+if IS_CUDA:
     from kernels import get_kernel
     cap = torch.cuda.get_device_capability()
     # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
     repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
     fa3 = get_kernel(repo).flash_attn_interface
 else:
-    fa3 = None  # Will use PyTorch SDPA on ROCm (dispatches to AOTriton)
+    fa3 = None  # Will use PyTorch SDPA on ROCm/CPU
+    if IS_ROCM:
+        print("ROCm detected: using PyTorch SDPA (Flash Attention not available on ROCm)")
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -132,6 +136,15 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
+        # Gradient checkpointing: trade compute for memory
+        if USE_GRADIENT_CHECKPOINTING and self.training:
+            return checkpoint(
+                self._forward_impl, x, ve, cos_sin, window_size,
+                use_reentrant=False
+            )
+        return self._forward_impl(x, ve, cos_sin, window_size)
+    
+    def _forward_impl(self, x, ve, cos_sin, window_size):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
         x = x + self.mlp(norm(x))
         return x
@@ -451,10 +464,10 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "L"    # sliding window pattern: L=full context (simpler for AMD GPUs)
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**17 # ~131K tokens per optimizer step (reduced for AMD GPUs)
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -466,8 +479,12 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEPTH = 4               # number of transformer layers (reduced for AMD GPUs to avoid OOM)
+DEVICE_BATCH_SIZE = 16  # per-device batch size (reduced for AMD GPUs to avoid OOM)
+
+# Memory optimizations
+USE_GRADIENT_CHECKPOINTING = False  # Enable to save memory (slower but allows larger batch)
+USE_TORCH_COMPILE = False  # Experimental: enable torch.compile on ROCm 7.0+
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -475,29 +492,70 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
+# Set float32 matmul precision for better stability on AMD GPUs
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+# Device detection: prefer CUDA/ROCm, fallback to CPU
+gpu_name = ""
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    # Print GPU info
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_idx = torch.cuda.current_device()
+    print(f"Using GPU {gpu_idx}: {gpu_name}")
+    
+    # Check for RDNA3 and set appropriate matmul precision
+    if "RX 7900" in gpu_name or "RX 7800" in gpu_name:
+        # RDNA3 GPUs work better with float16 for stability
+        print("RDNA3 GPU detected: using float16 for stability (BF16 can be unstable on RDNA3)")
+else:
+    device = torch.device("cpu")
+    print("Warning: No CUDA/ROCm GPU available, using CPU (slow)")
+
+# Use bfloat16 autocast (works on ROCm 7.0+)
+# For RDNA3 GPUs, use float16 if bfloat16 causes issues
+autocast_dtype = torch.float16 if ("RX 7900" in gpu_name or "RX 7800" in gpu_name) else torch.bfloat16
+print(f"Using autocast dtype: {autocast_dtype}")
+autocast_ctx = torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=autocast_dtype)
 # Peak BF16 FLOPS by GPU model (for MFU calculation)
 _GPU_PEAK_FLOPS = {
+    # NVIDIA GPUs
     "H100":   989.5e12,
     "H200":   989.5e12,
     "A100":   312.0e12,
     "B200":   2250.0e12,
-    # AMD Instinct
+    "RTX 4090": 369.5e12,
+    "RTX 4080": 242.5e12,
+    "RTX 3090": 142.5e12,
+    "RTX 3080": 118.5e12,
+    # AMD Instinct (ROCm)
     "MI300X": 1307.4e12,
     "MI308X": 1307.4e12,
     "MI325X": 1307.4e12,
     "MI250X": 383.0e12,
+    # AMD Radeon (RDNA 3) - approximate BF16 FLOPS
+    "RX 7900": 614.4e12,  # RX 7900 XTX/XT
+    "RX 7800": 422.4e12,
+    "RX 7700": 348.2e12,
+    "RX 6900": 230.4e12,  # RDNA 2
+    "RX 6800": 207.4e12,
 }
 
 def _detect_peak_flops():
     gpu_name = torch.cuda.get_device_name(0)
+    # Try exact match first
     for key, flops in _GPU_PEAK_FLOPS.items():
         if key.lower() in gpu_name.lower():
             print(f"Detected GPU: {gpu_name} -> peak BF16 FLOPS: {flops:.1e}")
             return flops
+    # Fallback: estimate based on compute units for AMD RDNA3
+    if "AMD" in gpu_name.upper() or "RADEON" in gpu_name.upper():
+        # Rough estimate for RDNA3: ~128 GFLOPS per CU for BF16
+        print(f"Warning: Unknown AMD GPU '{gpu_name}', estimating peak FLOPS")
+        return 500.0e12  # Conservative estimate
     print(f"Warning: Unknown GPU '{gpu_name}', defaulting to H100 peak FLOPS for MFU")
     return 989.5e12
 
@@ -546,10 +604,20 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-if not IS_ROCM:
+if IS_CUDA:
     model = torch.compile(model, dynamic=False)
+elif IS_ROCM:
+    # ROCm 7.0+ has experimental torch.compile support
+    if USE_TORCH_COMPILE:
+        try:
+            model = torch.compile(model, dynamic=False, backend="inductor")
+            print("ROCm: torch.compile enabled with inductor backend (experimental)")
+        except Exception as e:
+            print(f"ROCm: torch.compile failed ({e}), using eager mode")
+    else:
+        print("ROCm: torch.compile disabled (set USE_TORCH_COMPILE=True to enable)")
 else:
-    print("ROCm detected: torch.compile disabled (enable with PyTorch 2.9+ on ROCm)")
+    print("CPU mode: torch.compile disabled")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -585,7 +653,8 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -615,7 +684,8 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
 
@@ -660,7 +730,7 @@ with autocast_ctx:
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_BF16_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
