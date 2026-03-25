@@ -1,7 +1,9 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
+Autoresearch pretraining script. Single-GPU and Multi-GPU (DDP) training.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Usage: 
+  Single GPU: uv run train.py
+  Multi-GPU:  torchrun --nproc_per_node=2 train.py
 """
 
 import os
@@ -17,10 +19,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint  # For gradient checkpointing
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 # Detect AMD ROCm vs NVIDIA CUDA
 IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
 IS_CUDA = not IS_ROCM and torch.cuda.is_available()
+
+# Multi-GPU (DDP) setup
+IS_DDP = int(os.environ.get("WORLD_SIZE", "1")) > 1
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+GLOBAL_RANK = int(os.environ.get("RANK", 0))
+WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 
 if IS_CUDA:
     from kernels import get_kernel
@@ -491,9 +501,22 @@ USE_TORCH_COMPILE = False  # Experimental: enable torch.compile on ROCm 7.0+
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
+
+# Multi-GPU (DDP) initialization
+if IS_DDP:
+    dist.init_process_group(backend="nccl" if IS_CUDA else "gloo")
+    LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{LOCAL_RANK}" if torch.cuda.is_available() else f"cpu:{LOCAL_RANK}")
+    torch.cuda.set_device(LOCAL_RANK) if torch.cuda.is_available() else None
+    print(f"[Rank {GLOBAL_RANK}/{WORLD_SIZE}] Using device: {device}")
+else:
+    LOCAL_RANK = 0
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Set seed (different per rank for DDP)
+torch.manual_seed(42 + GLOBAL_RANK)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed(42 + GLOBAL_RANK)
 
 # Set float32 matmul precision for better stability on AMD GPUs
 torch.set_float32_matmul_precision("high")
@@ -501,24 +524,19 @@ torch.set_float32_matmul_precision("high")
 # Device detection: prefer CUDA/ROCm, fallback to CPU
 gpu_name = ""
 if torch.cuda.is_available():
-    device = torch.device("cuda")
-    # Print GPU info
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_idx = torch.cuda.current_device()
-    print(f"Using GPU {gpu_idx}: {gpu_name}")
-    
+    gpu_name = torch.cuda.get_device_name(LOCAL_RANK)
+    print(f"[Rank {GLOBAL_RANK}] Using GPU {LOCAL_RANK}: {gpu_name}")
+
     # Check for RDNA3 and set appropriate matmul precision
     if "RX 7900" in gpu_name or "RX 7800" in gpu_name:
-        # RDNA3 GPUs work better with float16 for stability
         print("RDNA3 GPU detected: using float16 for stability (BF16 can be unstable on RDNA3)")
 else:
-    device = torch.device("cpu")
     print("Warning: No CUDA/ROCm GPU available, using CPU (slow)")
 
 # Use bfloat16 autocast (works on ROCm 7.0+)
 # For RDNA3 GPUs, use float16 if bfloat16 causes issues
 autocast_dtype = torch.float16 if ("RX 7900" in gpu_name or "RX 7800" in gpu_name) else torch.bfloat16
-print(f"Using autocast dtype: {autocast_dtype}")
+print(f"[Rank {GLOBAL_RANK}] Using autocast dtype: {autocast_dtype}")
 autocast_ctx = torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=autocast_dtype)
 # Peak BF16 FLOPS by GPU model (for MFU calculation)
 _GPU_PEAK_FLOPS = {
@@ -583,6 +601,12 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 
+# Wrap model with DDP for multi-GPU training
+if IS_DDP:
+    model = DDP(model, device_ids=[LOCAL_RANK] if torch.cuda.is_available() else None,
+                find_unused_parameters=False, gradient_as_bucket_view=True)
+    print(f"[Rank {GLOBAL_RANK}] Model wrapped with DDP")
+
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
 for key, value in param_counts.items():
@@ -591,9 +615,16 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+# Adjust batch size for DDP (divide by world size)
+if IS_DDP:
+    effective_batch_size = TOTAL_BATCH_SIZE // WORLD_SIZE
+    print(f"[Rank {GLOBAL_RANK}] Multi-GPU: Global batch={TOTAL_BATCH_SIZE}, Per-GPU batch={effective_batch_size}")
+    tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+    grad_accum_steps = effective_batch_size // tokens_per_fwdbwd
+else:
+    tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+    assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -676,6 +707,13 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    
+    # Synchronize gradients and loss across GPUs for DDP
+    if IS_DDP:
+        # Average loss across GPUs for logging
+        train_loss_tensor = train_loss.clone().detach()
+        dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.AVG)
+        train_loss = train_loss_tensor
 
     train_loss_f = train_loss.item()
 
@@ -742,3 +780,8 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+# Cleanup DDP
+if IS_DDP:
+    dist.destroy_process_group()
+    print(f"[Rank {GLOBAL_RANK}] DDP process group destroyed")

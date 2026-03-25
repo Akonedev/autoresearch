@@ -55,10 +55,14 @@ uv pip install torch --index-url https://download.pytorch.org/whl/rocm7.0 \
 uv run prepare.py
 
 # 5. Run training experiment
-uv run train.py
+uv run python train.py
+
+# Multi-GPU (2+ GPUs)
+./train_multigpu.sh 2  # ou: torchrun --nproc_per_node=2 train.py
 ```
 
 See [README_ROCM.md](README_ROCM.md) for detailed AMD GPU setup and optimization guide.
+See [MULTIGPU_GUIDE.md](MULTIGPU_GUIDE.md) for multi-GPU training setup.
 
 ### CPU Only
 
